@@ -761,7 +761,6 @@ class SemanticSettingsTab extends PluginSettingTab {
             )
             .addButton(btn => btn
                 .setButtonText('Clear index')
-                .setDestructive()
                 .onClick(async () => {
                     this.plugin.embeddings.index = {};
                     await this.plugin.embeddings.save();
@@ -889,9 +888,8 @@ export default class SemanticBacklinksPlugin extends Plugin {
         let leaf = workspace.getLeavesOfType(VIEW_TYPE_RELATED)[0];
         if (!leaf) {
             leaf = workspace.getRightLeaf(false) ?? workspace.getLeaf(true);
-            await leaf.setViewState({ type: VIEW_TYPE_RELATED, active: true });
         }
-        await workspace.revealLeaf(leaf);
+        await leaf.setViewState({ type: VIEW_TYPE_RELATED, active: true });
         const active = workspace.getActiveFile();
         if (active) this.relatedView?.forceUpdate(active);
     }

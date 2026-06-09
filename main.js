@@ -618,7 +618,7 @@ var SemanticSettingsTab = class extends import_obsidian.PluginSettingTab {
         this.display();
       })
     ).addButton(
-      (btn) => btn.setButtonText("Clear index").setDestructive().onClick(async () => {
+      (btn) => btn.setButtonText("Clear index").onClick(async () => {
         this.plugin.embeddings.index = {};
         await this.plugin.embeddings.save();
         new import_obsidian.Notice("Index cleared.");
@@ -736,9 +736,8 @@ var SemanticBacklinksPlugin = class extends import_obsidian.Plugin {
     let leaf = workspace.getLeavesOfType(VIEW_TYPE_RELATED)[0];
     if (!leaf) {
       leaf = (_a = workspace.getRightLeaf(false)) != null ? _a : workspace.getLeaf(true);
-      await leaf.setViewState({ type: VIEW_TYPE_RELATED, active: true });
     }
-    await workspace.revealLeaf(leaf);
+    await leaf.setViewState({ type: VIEW_TYPE_RELATED, active: true });
     const active = workspace.getActiveFile();
     if (active)
       (_b = this.relatedView) == null ? void 0 : _b.forceUpdate(active);
