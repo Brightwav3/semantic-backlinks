@@ -596,55 +596,66 @@ class SemanticSettingsTab extends PluginSettingTab {
                 .addOption('lmstudio', 'LM Studio')
                 .addOption('openai',   'OpenAI (API)')
                 .setValue(s.provider)
-                .onChange(async (v: string) => { s.provider = v as PluginSettings['provider']; await save(); this.display(); })
-            );
-
-        const urlDesc = s.provider === 'openai'
-            ? 'OpenAI API base URL. Change to use Azure OpenAI or another compatible endpoint.'
-            : 'Base URL of your Ollama or LM Studio instance. For mobile, enter your Tailscale IP (e.g. http://100.x.x.x:11434).';
-        new Setting(el)
-            .setName('Server URL')
-            .setDesc(urlDesc)
-            .addText(t => t
-                .setPlaceholder(s.provider === 'openai' ? 'https://api.openai.com' : 'http://localhost:11434')
-                .setValue(s.serverUrl)
-                .onChange(async (v: string) => { s.serverUrl = v.trim(); await save(); })
-            );
-
-        if (s.provider === 'openai') {
-            new Setting(el)
-                .setName('API key')
-                .setDesc('Your OpenAI API key (sk-…). Stored locally in data.json, never synced.')
-                .addText(t => {
-                    t.inputEl.type = 'password';
-                    t.setPlaceholder('sk-…')
-                     .setValue(s.apiKey)
-                     .onChange(async (v: string) => { s.apiKey = v.trim(); await save(); });
-                });
-        }
-
-        const modelDesc = s.provider === 'openai'
-            ? 'OpenAI embedding model (e.g. text-embedding-3-small, text-embedding-3-large).'
-            : 'Model used to generate embeddings. Run "ollama list" to see installed models.';
-        new Setting(el)
-            .setName('Embedding model')
-            .setDesc(modelDesc)
-            .addText(t => t
-                .setPlaceholder(s.provider === 'openai' ? 'text-embedding-3-small' : 'bge-m3')
-                .setValue(s.embeddingModel)
-                .onChange(async (v: string) => { s.embeddingModel = v.trim(); await save(); })
-            )
-            .addButton(btn => btn
-                .setButtonText('Test connection')
-                .onClick(async () => {
-                    try {
-                        await this.plugin.embeddings.getEmbedding('test');
-                        new Notice('✓ Connection works.');
-                    } catch (e) {
-                        new Notice(`✗ ${(e as Error).message}`);
-                    }
+                .onChange(async (v: string) => {
+                    s.provider = v as PluginSettings['provider'];
+                    await save();
+                    providerEl.empty();
+                    renderProviderFields(providerEl);
                 })
             );
+
+        const providerEl = el.createDiv();
+
+        const renderProviderFields = (container: HTMLElement) => {
+            const urlDesc = s.provider === 'openai'
+                ? 'OpenAI API base URL. Change to use Azure OpenAI or another compatible endpoint.'
+                : 'Base URL of your Ollama or LM Studio instance. For mobile, enter your Tailscale IP (e.g. http://100.x.x.x:11434).';
+            new Setting(container)
+                .setName('Server URL')
+                .setDesc(urlDesc)
+                .addText(t => t
+                    .setPlaceholder(s.provider === 'openai' ? 'https://api.openai.com' : 'http://localhost:11434')
+                    .setValue(s.serverUrl)
+                    .onChange(async (v: string) => { s.serverUrl = v.trim(); await save(); })
+                );
+
+            if (s.provider === 'openai') {
+                new Setting(container)
+                    .setName('API key')
+                    .setDesc('Your OpenAI API key (sk-…). Stored locally in data.json, never synced.')
+                    .addText(t => {
+                        t.inputEl.type = 'password';
+                        t.setPlaceholder('sk-…')
+                         .setValue(s.apiKey)
+                         .onChange(async (v: string) => { s.apiKey = v.trim(); await save(); });
+                    });
+            }
+
+            const modelDesc = s.provider === 'openai'
+                ? 'OpenAI embedding model (e.g. text-embedding-3-small, text-embedding-3-large).'
+                : 'Model used to generate embeddings. Run "ollama list" to see installed models.';
+            new Setting(container)
+                .setName('Embedding model')
+                .setDesc(modelDesc)
+                .addText(t => t
+                    .setPlaceholder(s.provider === 'openai' ? 'text-embedding-3-small' : 'bge-m3')
+                    .setValue(s.embeddingModel)
+                    .onChange(async (v: string) => { s.embeddingModel = v.trim(); await save(); })
+                )
+                .addButton(btn => btn
+                    .setButtonText('Test connection')
+                    .onClick(async () => {
+                        try {
+                            await this.plugin.embeddings.getEmbedding('test');
+                            new Notice('✓ Connection works.');
+                        } catch (e) {
+                            new Notice(`✗ ${(e as Error).message}`);
+                        }
+                    })
+                );
+        };
+
+        renderProviderFields(providerEl);
 
         // ── Inline suggest ──────────────────────────────────────────────────
         new Setting(el).setName('Inline suggest').setHeading();
@@ -745,7 +756,7 @@ class SemanticSettingsTab extends PluginSettingTab {
                 .onChange(async (v: number) => { s.reindexDebounceMs = v * 1000; await save(); })
             );
 
-        new Setting(el)
+        const indexedSetting = new Setting(el)
             .setName(`Indexed notes: ${this.plugin.embeddings.indexedCount}`)
             .addButton(btn => btn
                 .setButtonText('Re-index vault')
@@ -756,7 +767,7 @@ class SemanticSettingsTab extends PluginSettingTab {
                     new Notice(`Indexed ${n} notes.`);
                     btn.setButtonText('Re-index vault');
                     btn.setDisabled(false);
-                    this.display();
+                    indexedSetting.setName(`Indexed notes: ${this.plugin.embeddings.indexedCount}`);
                 })
             )
             .addButton(btn => btn
@@ -765,7 +776,7 @@ class SemanticSettingsTab extends PluginSettingTab {
                     this.plugin.embeddings.index = {};
                     await this.plugin.embeddings.save();
                     new Notice('Index cleared.');
-                    this.display();
+                    indexedSetting.setName(`Indexed notes: 0`);
                 })
             );
     }

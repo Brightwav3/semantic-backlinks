@@ -514,41 +514,46 @@ var SemanticSettingsTab = class extends import_obsidian.PluginSettingTab {
       (d) => d.addOption("ollama", "Ollama").addOption("lmstudio", "LM Studio").addOption("openai", "OpenAI (API)").setValue(s.provider).onChange(async (v) => {
         s.provider = v;
         await save();
-        this.display();
+        providerEl.empty();
+        renderProviderFields(providerEl);
       })
     );
-    const urlDesc = s.provider === "openai" ? "OpenAI API base URL. Change to use Azure OpenAI or another compatible endpoint." : "Base URL of your Ollama or LM Studio instance. For mobile, enter your Tailscale IP (e.g. http://100.x.x.x:11434).";
-    new import_obsidian.Setting(el).setName("Server URL").setDesc(urlDesc).addText(
-      (t) => t.setPlaceholder(s.provider === "openai" ? "https://api.openai.com" : "http://localhost:11434").setValue(s.serverUrl).onChange(async (v) => {
-        s.serverUrl = v.trim();
-        await save();
-      })
-    );
-    if (s.provider === "openai") {
-      new import_obsidian.Setting(el).setName("API key").setDesc("Your OpenAI API key (sk-\u2026). Stored locally in data.json, never synced.").addText((t) => {
-        t.inputEl.type = "password";
-        t.setPlaceholder("sk-\u2026").setValue(s.apiKey).onChange(async (v) => {
-          s.apiKey = v.trim();
+    const providerEl = el.createDiv();
+    const renderProviderFields = (container) => {
+      const urlDesc = s.provider === "openai" ? "OpenAI API base URL. Change to use Azure OpenAI or another compatible endpoint." : "Base URL of your Ollama or LM Studio instance. For mobile, enter your Tailscale IP (e.g. http://100.x.x.x:11434).";
+      new import_obsidian.Setting(container).setName("Server URL").setDesc(urlDesc).addText(
+        (t) => t.setPlaceholder(s.provider === "openai" ? "https://api.openai.com" : "http://localhost:11434").setValue(s.serverUrl).onChange(async (v) => {
+          s.serverUrl = v.trim();
           await save();
+        })
+      );
+      if (s.provider === "openai") {
+        new import_obsidian.Setting(container).setName("API key").setDesc("Your OpenAI API key (sk-\u2026). Stored locally in data.json, never synced.").addText((t) => {
+          t.inputEl.type = "password";
+          t.setPlaceholder("sk-\u2026").setValue(s.apiKey).onChange(async (v) => {
+            s.apiKey = v.trim();
+            await save();
+          });
         });
-      });
-    }
-    const modelDesc = s.provider === "openai" ? "OpenAI embedding model (e.g. text-embedding-3-small, text-embedding-3-large)." : 'Model used to generate embeddings. Run "ollama list" to see installed models.';
-    new import_obsidian.Setting(el).setName("Embedding model").setDesc(modelDesc).addText(
-      (t) => t.setPlaceholder(s.provider === "openai" ? "text-embedding-3-small" : "bge-m3").setValue(s.embeddingModel).onChange(async (v) => {
-        s.embeddingModel = v.trim();
-        await save();
-      })
-    ).addButton(
-      (btn) => btn.setButtonText("Test connection").onClick(async () => {
-        try {
-          await this.plugin.embeddings.getEmbedding("test");
-          new import_obsidian.Notice("\u2713 Connection works.");
-        } catch (e) {
-          new import_obsidian.Notice(`\u2717 ${e.message}`);
-        }
-      })
-    );
+      }
+      const modelDesc = s.provider === "openai" ? "OpenAI embedding model (e.g. text-embedding-3-small, text-embedding-3-large)." : 'Model used to generate embeddings. Run "ollama list" to see installed models.';
+      new import_obsidian.Setting(container).setName("Embedding model").setDesc(modelDesc).addText(
+        (t) => t.setPlaceholder(s.provider === "openai" ? "text-embedding-3-small" : "bge-m3").setValue(s.embeddingModel).onChange(async (v) => {
+          s.embeddingModel = v.trim();
+          await save();
+        })
+      ).addButton(
+        (btn) => btn.setButtonText("Test connection").onClick(async () => {
+          try {
+            await this.plugin.embeddings.getEmbedding("test");
+            new import_obsidian.Notice("\u2713 Connection works.");
+          } catch (e) {
+            new import_obsidian.Notice(`\u2717 ${e.message}`);
+          }
+        })
+      );
+    };
+    renderProviderFields(providerEl);
     new import_obsidian.Setting(el).setName("Inline suggest").setHeading();
     new import_obsidian.Setting(el).setName("Enable inline suggest").setDesc("Show link suggestions while you type.").addToggle((t) => t.setValue(s.enableInlineSuggest).onChange(async (v) => {
       s.enableInlineSuggest = v;
@@ -607,7 +612,7 @@ var SemanticSettingsTab = class extends import_obsidian.PluginSettingTab {
         await save();
       })
     );
-    new import_obsidian.Setting(el).setName(`Indexed notes: ${this.plugin.embeddings.indexedCount}`).addButton(
+    const indexedSetting = new import_obsidian.Setting(el).setName(`Indexed notes: ${this.plugin.embeddings.indexedCount}`).addButton(
       (btn) => btn.setButtonText("Re-index vault").onClick(async () => {
         btn.setButtonText("Indexing\u2026");
         btn.setDisabled(true);
@@ -615,14 +620,14 @@ var SemanticSettingsTab = class extends import_obsidian.PluginSettingTab {
         new import_obsidian.Notice(`Indexed ${n} notes.`);
         btn.setButtonText("Re-index vault");
         btn.setDisabled(false);
-        this.display();
+        indexedSetting.setName(`Indexed notes: ${this.plugin.embeddings.indexedCount}`);
       })
     ).addButton(
       (btn) => btn.setButtonText("Clear index").onClick(async () => {
         this.plugin.embeddings.index = {};
         await this.plugin.embeddings.save();
         new import_obsidian.Notice("Index cleared.");
-        this.display();
+        indexedSetting.setName(`Indexed notes: 0`);
       })
     );
   }
