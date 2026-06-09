@@ -11,6 +11,7 @@ import {
     Notice,
     Plugin,
     PluginSettingTab,
+    requestUrl,
     Setting,
     TFile,
     WorkspaceLeaf,
@@ -44,7 +45,7 @@ interface IndexEntry {
 interface SerializedEntry {
     mtime:      number;
     title:      string;
-    embeddings: string[]; // base64-encoded Float32Arrays
+    embeddings: string[];
 }
 
 interface SearchResult {
@@ -159,14 +160,11 @@ class EmbeddingsManager {
     get settings(): PluginSettings { return this.plugin.settings; }
 
     // Embeddings live in a separate file so Remotely Save never syncs them.
-    // (Remotely Save only syncs data.json / main.js / manifest.json / styles.css
-    //  from plugin folders — everything else is skipped.)
     get _indexPath(): string {
         return `${this.plugin.app.vault.configDir}/plugins/semantic-backlinks/embeddings.json`;
     }
 
     async load(): Promise<void> {
-        // 1. Try the dedicated index file first.
         try {
             const raw    = await this.plugin.app.vault.adapter.read(this._indexPath);
             const parsed = JSON.parse(raw) as Record<string, SerializedEntry & { embedding?: number[] | string }>;
@@ -183,11 +181,12 @@ class EmbeddingsManager {
             return;
         } catch { /* file doesn't exist yet */ }
 
-        // 2. Migration: old format stored embeddings inside data.json.
+        // Migration: old format stored embeddings inside data.json.
         try {
-            const data = await this.plugin.loadData() as Record<string, unknown> | null;
-            if (data?.embeddings && typeof data.embeddings === 'object') {
-                const oldIndex = data.embeddings as Record<string, SerializedEntry & { embedding?: number[] }>;
+            const raw = (await this.plugin.loadData()) as Record<string, unknown> | null ?? {};
+            const oldEmbeddings = raw['embeddings'];
+            if (oldEmbeddings && typeof oldEmbeddings === 'object') {
+                const oldIndex = oldEmbeddings as Record<string, SerializedEntry & { embedding?: number[] }>;
                 for (const [path, entry] of Object.entries(oldIndex)) {
                     const embs = entry.embeddings ?? (entry.embedding ? [entry.embedding] : []);
                     this.index[path] = {
@@ -197,8 +196,8 @@ class EmbeddingsManager {
                     };
                 }
                 await this.save();
-                const { embeddings, ...rest } = data;
-                await this.plugin.saveData(rest);
+                delete raw['embeddings'];
+                await this.plugin.saveData(raw);
                 return;
             }
         } catch { /* no data.json or parse error */ }
@@ -228,49 +227,49 @@ class EmbeddingsManager {
             } catch (e) {
                 // Don't retry 4xx (auth errors, bad requests) or last attempt.
                 if (i >= attempts - 1 || /HTTP 4\d\d/.test((e as Error).message)) throw e;
-                await new Promise(r => setTimeout(r, 300 * 2 ** i));
+                await new Promise(r => window.setTimeout(r, 300 * 2 ** i));
             }
         }
     }
 
-    // Raw fetch — always goes through the queue via getEmbedding().
     private async _fetchEmbedding(text: string): Promise<number[]> {
         const { provider, serverUrl, embeddingModel, apiKey } = this.settings;
 
         if (provider === 'ollama') {
-            const res = await fetch(`${serverUrl}/api/embed`, {
-                method:  'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body:    JSON.stringify({ model: embeddingModel, input: text }),
+            const res = await requestUrl({
+                url:         `${serverUrl}/api/embed`,
+                method:      'POST',
+                contentType: 'application/json',
+                body:        JSON.stringify({ model: embeddingModel, input: text }),
+                throw:       false,
             });
-            if (!res.ok) throw new Error(`Ollama HTTP ${res.status}`);
-            const json = await res.json() as { embeddings: number[][] };
-            return json.embeddings[0];
+            if (res.status !== 200) throw new Error(`Ollama HTTP ${res.status}`);
+            return (res.json as { embeddings: number[][] }).embeddings[0];
         } else {
             // lmstudio and openai share the OpenAI-compatible /v1/embeddings endpoint.
-            const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+            const headers: Record<string, string> = {};
             if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
-            const res = await fetch(`${serverUrl}/v1/embeddings`, {
-                method:  'POST',
+            const res = await requestUrl({
+                url:         `${serverUrl}/v1/embeddings`,
+                method:      'POST',
+                contentType: 'application/json',
                 headers,
-                body:    JSON.stringify({ model: embeddingModel, input: text }),
+                body:        JSON.stringify({ model: embeddingModel, input: text }),
+                throw:       false,
             });
-            if (!res.ok) throw new Error(`${provider === 'openai' ? 'OpenAI' : 'LM Studio'} HTTP ${res.status}`);
-            const json = await res.json() as { data: [{ embedding: number[] }] };
-            return json.data[0].embedding;
+            if (res.status !== 200) throw new Error(`${provider === 'openai' ? 'OpenAI' : 'LM Studio'} HTTP ${res.status}`);
+            return (res.json as { data: [{ embedding: number[] }] }).data[0].embedding;
         }
     }
 
-    // Public — serialised through the queue, retried on transient errors.
     async getEmbedding(text: string): Promise<number[]> {
         return this._queue.run(() => this._retry(() => this._fetchEmbedding(text)));
     }
 
-    // Split note text into overlapping chunks so long notes aren't truncated.
     private _chunkText(title: string, content: string): string[] {
-        const CHUNK   = 1500;   // chars per chunk
-        const OVERLAP = 300;    // chars reused between adjacent chunks
-        const MAX     = 8;      // safety cap — avoid runaway API calls
+        const CHUNK   = 1500;
+        const OVERLAP = 300;
+        const MAX     = 8;
         const full    = `${title}\n${content}`;
         if (full.length <= CHUNK) return [full];
         const chunks: string[] = [];
@@ -306,7 +305,6 @@ class EmbeddingsManager {
             const file   = files[i];
             if (isExcluded(file.path, this.settings.excludedFolders)) continue;
             const cached = this.index[file.path];
-            // Skip only when mtime matches AND entry is in the binary chunked format.
             if (cached?.mtime === file.stat.mtime && Array.isArray(cached?.embeddings)) continue;
             if (await this.indexFile(file)) changed++;
             onProgress?.(i + 1, files.length, file.basename);
@@ -324,7 +322,7 @@ class EmbeddingsManager {
 
     async search(query: string, topK: number, excludePath: string | null = null): Promise<SearchResult[]> {
         const queryEmb = new Float32Array(await this.getEmbedding(query));
-        const results: SearchResult[]  = [];
+        const results: SearchResult[] = [];
 
         for (const [path, entry] of Object.entries(this.index)) {
             if (path === excludePath) continue;
@@ -363,7 +361,7 @@ class RelatedNotesView extends ItemView {
     async onOpen(): Promise<void> {
         this.renderPlaceholder('Open a note to see semantically related notes.');
         const active = this.plugin.app.workspace.getActiveFile();
-        if (active) this.update(active);
+        if (active) void this.update(active);
     }
 
     renderPlaceholder(msg: string): void {
@@ -409,8 +407,8 @@ class RelatedNotesView extends ItemView {
         el.addClass('semantic-view');
 
         const header = el.createEl('div', { cls: 'semantic-header' });
-        header.createEl('span', { text: 'Related Notes',  cls: 'semantic-header-title' });
-        header.createEl('span', { text: file.basename,    cls: 'semantic-header-sub' });
+        header.createEl('span', { text: 'Related Notes', cls: 'semantic-header-title' });
+        header.createEl('span', { text: file.basename, cls: 'semantic-header-sub' });
 
         if (results.length === 0) {
             el.createEl('p', { text: 'No related notes found.', cls: 'semantic-placeholder' });
@@ -424,8 +422,8 @@ class RelatedNotesView extends ItemView {
             const item     = list.createEl('div', { cls: 'semantic-item' });
 
             const bar = item.createEl('div', { cls: 'semantic-bar' });
-            bar.style.setProperty('--bar-width',  `${pct}%`);
-            bar.style.setProperty('--bar-color',  barColor);
+            bar.style.setProperty('--bar-width', `${pct}%`);
+            bar.style.setProperty('--bar-color', barColor);
 
             const info = item.createEl('div', { cls: 'semantic-info' });
             const link = info.createEl('a', { text: r.title, cls: 'semantic-link internal-link' });
@@ -433,21 +431,21 @@ class RelatedNotesView extends ItemView {
                 e.preventDefault();
                 const f = this.plugin.app.vault.getAbstractFileByPath(r.path);
                 if (f instanceof TFile)
-                    this.plugin.app.workspace.getLeaf(e.ctrlKey || e.metaKey).openFile(f);
+                    void this.plugin.app.workspace.getLeaf(e.ctrlKey || e.metaKey).openFile(f);
             });
             info.createEl('span', { text: `${pct}%`, cls: 'semantic-score' });
         }
     }
 
-    forceUpdate(file: TFile): void { this.currentFile = null; this.update(file); }
+    forceUpdate(file: TFile): void { this.currentFile = null; void this.update(file); }
 }
 
 // ─── Editor Suggest ───────────────────────────────────────────────────────────
 
 class SemanticSuggest extends EditorSuggest<SearchResult> {
-    plugin:                  SemanticBacklinksPlugin;
-    private _semanticCache:  Map<string, SearchResult[]>;
-    private _prefetchTimer:  ReturnType<typeof setTimeout> | null;
+    plugin:                 SemanticBacklinksPlugin;
+    private _semanticCache: Map<string, SearchResult[]>;
+    private _prefetchTimer: number | null;
 
     constructor(plugin: SemanticBacklinksPlugin) {
         super(plugin.app);
@@ -503,15 +501,17 @@ class SemanticSuggest extends EditorSuggest<SearchResult> {
 
     private _prefetch(query: string): void {
         if (this._semanticCache.has(query) || this.plugin.embeddings.indexedCount === 0) return;
-        if (this._prefetchTimer) clearTimeout(this._prefetchTimer);
-        this._prefetchTimer = setTimeout(async () => {
-            try {
-                const path    = this.plugin.app.workspace.getActiveFile()?.path ?? null;
-                const results = await this.plugin.embeddings.search(query, this.settings.maxSuggestions, path);
-                this._semanticCache.set(query, results);
-                if (this._semanticCache.size > 50)
-                    this._semanticCache.delete(this._semanticCache.keys().next().value!);
-            } catch { /* ignore */ }
+        if (this._prefetchTimer !== null) window.clearTimeout(this._prefetchTimer);
+        this._prefetchTimer = window.setTimeout(() => {
+            void (async () => {
+                try {
+                    const path    = this.plugin.app.workspace.getActiveFile()?.path ?? null;
+                    const results = await this.plugin.embeddings.search(query, this.settings.maxSuggestions, path);
+                    this._semanticCache.set(query, results);
+                    if (this._semanticCache.size > 50)
+                        this._semanticCache.delete(this._semanticCache.keys().next().value as string);
+                } catch { /* ignore */ }
+            })();
         }, 150);
     }
 
@@ -534,7 +534,7 @@ class SemanticSuggest extends EditorSuggest<SearchResult> {
                     semantic = await this.plugin.embeddings.search(query, this.settings.maxSuggestions, path);
                     this._semanticCache.set(query, semantic);
                     if (this._semanticCache.size > 50)
-                        this._semanticCache.delete(this._semanticCache.keys().next().value!);
+                        this._semanticCache.delete(this._semanticCache.keys().next().value as string);
                 } catch { /* ignore */ }
             }
         }
@@ -586,7 +586,7 @@ class SemanticSettingsTab extends PluginSettingTab {
         el.empty();
 
         // ── Embedding provider ──────────────────────────────────────────────
-        el.createEl('h3', { text: 'Embedding provider' });
+        new Setting(el).setName('Embedding provider').setHeading();
 
         new Setting(el)
             .setName('Provider')
@@ -647,7 +647,7 @@ class SemanticSettingsTab extends PluginSettingTab {
             );
 
         // ── Inline suggest ──────────────────────────────────────────────────
-        el.createEl('h3', { text: 'Inline suggest' });
+        new Setting(el).setName('Inline suggest').setHeading();
 
         new Setting(el)
             .setName('Enable inline suggest')
@@ -700,7 +700,7 @@ class SemanticSettingsTab extends PluginSettingTab {
             );
 
         // ── Related Notes panel ─────────────────────────────────────────────
-        el.createEl('h3', { text: 'Related Notes panel' });
+        new Setting(el).setName('Related Notes panel').setHeading();
 
         new Setting(el)
             .setName('Enable Related Notes panel')
@@ -718,7 +718,7 @@ class SemanticSettingsTab extends PluginSettingTab {
             );
 
         // ── Excluded folders ────────────────────────────────────────────────
-        el.createEl('h3', { text: 'Excluded folders' });
+        new Setting(el).setName('Excluded folders').setHeading();
 
         new Setting(el)
             .setName('Excluded folders')
@@ -733,7 +733,7 @@ class SemanticSettingsTab extends PluginSettingTab {
             );
 
         // ── Index ───────────────────────────────────────────────────────────
-        el.createEl('h3', { text: 'Index' });
+        new Setting(el).setName('Index').setHeading();
 
         new Setting(el)
             .setName('Auto-reindex delay (seconds)')
@@ -761,7 +761,7 @@ class SemanticSettingsTab extends PluginSettingTab {
             )
             .addButton(btn => btn
                 .setButtonText('Clear index')
-                .setWarning()
+                .setDestructive()
                 .onClick(async () => {
                     this.plugin.embeddings.index = {};
                     await this.plugin.embeddings.save();
@@ -775,10 +775,15 @@ class SemanticSettingsTab extends PluginSettingTab {
 // ─── Main Plugin ──────────────────────────────────────────────────────────────
 
 export default class SemanticBacklinksPlugin extends Plugin {
-    settings:    PluginSettings;
-    embeddings:  EmbeddingsManager;
-    relatedView: RelatedNotesView | undefined;
-    private modifyTimers: Map<string, ReturnType<typeof setTimeout>>;
+    settings!:   PluginSettings;
+    embeddings!: EmbeddingsManager;
+    private modifyTimers!: Map<string, number>;
+
+    // Access the view via the workspace rather than storing a reference,
+    // to avoid the memory leak flagged by the Obsidian linter.
+    get relatedView(): RelatedNotesView | undefined {
+        return this.app.workspace.getLeavesOfType(VIEW_TYPE_RELATED)[0]?.view as RelatedNotesView | undefined;
+    }
 
     async onload(): Promise<void> {
         await this.loadSettings();
@@ -789,17 +794,17 @@ export default class SemanticBacklinksPlugin extends Plugin {
 
         this.registerView(
             VIEW_TYPE_RELATED,
-            (leaf) => (this.relatedView = new RelatedNotesView(leaf, this))
+            (leaf) => new RelatedNotesView(leaf, this)
         );
 
         this.registerEditorSuggest(new SemanticSuggest(this));
         this.addSettingTab(new SemanticSettingsTab(this.app, this));
-        this.addRibbonIcon('brain-circuit', 'Semantic Backlinks', () => this.activateView());
+        this.addRibbonIcon('brain-circuit', 'Semantic Backlinks', () => { void this.activateView(); });
 
         this.addCommand({
             id:       'show-related-notes',
             name:     'Show related notes panel',
-            callback: () => this.activateView(),
+            callback: () => { void this.activateView(); },
         });
 
         this.addCommand({
@@ -820,58 +825,62 @@ export default class SemanticBacklinksPlugin extends Plugin {
             name:     'Refresh related notes for current file',
             callback: () => {
                 const file = this.app.workspace.getActiveFile();
-                if (file && this.relatedView) this.relatedView.forceUpdate(file);
+                if (file) this.relatedView?.forceUpdate(file);
             },
         });
 
         this.registerEvent(this.app.workspace.on('file-open', (file) => {
             if (file && this.relatedView && this.settings.enableRelatedPanel)
-                this.relatedView.update(file);
+                void this.relatedView.update(file);
         }));
 
         this.registerEvent(this.app.vault.on('modify', (file) => {
             if (!(file instanceof TFile) || file.extension !== 'md') return;
-            clearTimeout(this.modifyTimers.get(file.path));
-            this.modifyTimers.set(file.path, setTimeout(async () => {
-                this.modifyTimers.delete(file.path);
-                if (this.embeddings.indexing) return; // skip during full vault reindex
-                await this.embeddings.indexFile(file);
-                await this.embeddings.save();
-                const active = this.app.workspace.getActiveFile();
-                if (this.relatedView && active?.path === file.path)
-                    this.relatedView.forceUpdate(file);
+            window.clearTimeout(this.modifyTimers.get(file.path));
+            this.modifyTimers.set(file.path, window.setTimeout(() => {
+                void (async () => {
+                    this.modifyTimers.delete(file.path);
+                    if (this.embeddings.indexing) return;
+                    await this.embeddings.indexFile(file);
+                    await this.embeddings.save();
+                    const active = this.app.workspace.getActiveFile();
+                    if (this.relatedView && active?.path === file.path)
+                        this.relatedView.forceUpdate(file);
+                })();
             }, this.settings.reindexDebounceMs));
         }));
 
-        this.registerEvent(this.app.vault.on('delete', async (file) => {
+        this.registerEvent(this.app.vault.on('delete', (file) => {
             if (file instanceof TFile) {
                 delete this.embeddings.index[file.path];
-                await this.embeddings.save();
+                void this.embeddings.save();
             }
         }));
 
-        this.registerEvent(this.app.vault.on('rename', async (file, oldPath) => {
+        this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
             if (file instanceof TFile && file.extension === 'md' && this.embeddings.index[oldPath]) {
                 this.embeddings.index[file.path] = { ...this.embeddings.index[oldPath], title: file.basename };
                 delete this.embeddings.index[oldPath];
-                await this.embeddings.save();
+                void this.embeddings.save();
             }
         }));
 
-        setTimeout(async () => {
-            const unindexed = this.app.vault.getMarkdownFiles().filter(f => {
-                if (isExcluded(f.path, this.settings.excludedFolders)) return false;
-                const e = this.embeddings.index[f.path];
-                return !e || !Array.isArray(e.embeddings);
-            });
-            if (unindexed.length > 0) {
-                const notice = new Notice(`Semantic Backlinks: indexing ${unindexed.length} notes…`, 0);
-                await this.embeddings.indexVault((done, total, name) => {
-                    notice.setMessage(`Semantic Backlinks: ${done}/${total} — ${name}`);
+        window.setTimeout(() => {
+            void (async () => {
+                const unindexed = this.app.vault.getMarkdownFiles().filter(f => {
+                    if (isExcluded(f.path, this.settings.excludedFolders)) return false;
+                    const e = this.embeddings.index[f.path];
+                    return !e || !Array.isArray(e.embeddings);
                 });
-                notice.hide();
-                new Notice('Semantic Backlinks: index ready.');
-            }
+                if (unindexed.length > 0) {
+                    const notice = new Notice(`Semantic Backlinks: indexing ${unindexed.length} notes…`, 0);
+                    await this.embeddings.indexVault((done, total, name) => {
+                        notice.setMessage(`Semantic Backlinks: ${done}/${total} — ${name}`);
+                    });
+                    notice.hide();
+                    new Notice('Semantic Backlinks: index ready.');
+                }
+            })();
         }, 5000);
     }
 
@@ -884,13 +893,13 @@ export default class SemanticBacklinksPlugin extends Plugin {
         }
         workspace.revealLeaf(leaf);
         const active = workspace.getActiveFile();
-        if (active && this.relatedView) this.relatedView.forceUpdate(active);
+        if (active) this.relatedView?.forceUpdate(active);
     }
 
     async loadSettings(): Promise<void> {
-        const data = (await this.loadData()) ?? {};
-        const { embeddings, ...rest } = data as { embeddings?: unknown } & Partial<PluginSettings>;
-        this.settings = Object.assign({}, DEFAULT_SETTINGS, rest);
+        const raw = (await this.loadData()) as Record<string, unknown> | null ?? {};
+        delete raw['embeddings'];
+        this.settings = Object.assign({}, DEFAULT_SETTINGS, raw) as PluginSettings;
     }
 
     async saveSettings(): Promise<void> {
@@ -898,7 +907,6 @@ export default class SemanticBacklinksPlugin extends Plugin {
     }
 
     onunload(): void {
-        this.app.workspace.detachLeavesOfType(VIEW_TYPE_RELATED);
-        for (const t of this.modifyTimers.values()) clearTimeout(t);
+        for (const t of this.modifyTimers.values()) window.clearTimeout(t);
     }
 }
