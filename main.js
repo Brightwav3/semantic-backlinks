@@ -356,17 +356,23 @@ ${content}`;
       return 0;
     this.indexing = true;
     const files = this.plugin.app.vault.getMarkdownFiles();
+    const toIndex = files.filter((f) => {
+      if (isExcluded(f.path, this.settings.excludedFolders))
+        return false;
+      const cached = this.index[f.path];
+      return !((cached == null ? void 0 : cached.mtime) === f.stat.mtime && Array.isArray(cached == null ? void 0 : cached.embeddings));
+    });
+    const fileConcurrency = toIndex.length < 50 ? 2 : toIndex.length < 200 ? 4 : 8;
     let changed = 0;
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i];
-      if (isExcluded(file.path, this.settings.excludedFolders))
-        continue;
-      const cached = this.index[file.path];
-      if ((cached == null ? void 0 : cached.mtime) === file.stat.mtime && Array.isArray(cached == null ? void 0 : cached.embeddings))
-        continue;
-      if (await this.indexFile(file))
-        changed++;
-      onProgress == null ? void 0 : onProgress(i + 1, files.length, file.basename);
+    let done = 0;
+    for (let i = 0; i < toIndex.length; i += fileConcurrency) {
+      const batch = toIndex.slice(i, i + fileConcurrency);
+      const results = await Promise.all(batch.map(async (file) => {
+        const ok = await this.indexFile(file);
+        onProgress == null ? void 0 : onProgress(++done, toIndex.length, file.basename);
+        return ok;
+      }));
+      changed += results.filter(Boolean).length;
     }
     const paths = new Set(files.map((f) => f.path));
     for (const p of Object.keys(this.index)) {
