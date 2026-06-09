@@ -230,7 +230,7 @@ class EmbeddingsManager {
         this.index         = {};
         this.sentenceIndex = {};
         this.indexing      = false;
-        this._queue        = new EmbedQueue(2);
+        this._queue        = new EmbedQueue(4);
     }
 
     get settings(): PluginSettings { return this.plugin.settings; }
@@ -421,17 +421,26 @@ class EmbeddingsManager {
 
     async indexFile(file: TFile): Promise<boolean> {
         try {
-            const content    = await this.plugin.app.vault.cachedRead(file);
-            const chunks     = this._chunkText(file.basename, content);
-            const raw        = await Promise.all(chunks.map(c => this.getEmbedding(c)));
-            const embeddings = raw.map(e => new Float32Array(e));
-            this.index[file.path] = { mtime: file.stat.mtime, title: file.basename, embeddings };
+            const content   = await this.plugin.app.vault.cachedRead(file);
+            const chunks    = this._chunkText(file.basename, content);
+            const sentences = this.settings.enableSnippets
+                ? splitIntoSentences(content).slice(0, 20)
+                : [];
 
-            // Sentence-level 1-bit index — one batch request per note instead of N.
+            // Run note-level and sentence-level embedding in parallel.
+            const [raw, sentRaw] = await Promise.all([
+                Promise.all(chunks.map(c => this.getEmbedding(c))),
+                sentences.length > 0 ? this.getEmbeddingBatch(sentences) : Promise.resolve([] as number[][]),
+            ]);
+
+            this.index[file.path] = {
+                mtime:      file.stat.mtime,
+                title:      file.basename,
+                embeddings: raw.map(e => new Float32Array(e)),
+            };
+
             if (this.settings.enableSnippets) {
-                const sentences = splitIntoSentences(content).slice(0, 20); // cap at 20
-                if (sentences.length > 0) {
-                    const sentRaw = await this.getEmbeddingBatch(sentences);
+                if (sentRaw.length > 0) {
                     this.sentenceIndex[file.path] = sentRaw.map((r, i) => ({
                         sentence: sentences[i],
                         bits:     quantizeTo1Bit(new Float32Array(r)),
