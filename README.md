@@ -127,6 +127,10 @@ npm run dev     # watch mode
 
 Requires Node.js 16+. The build uses esbuild to bundle `src/main.ts` into a single `main.js`.
 
+## Issues
+
+Found a bug or have a feature request? [Open a new issue](https://github.com/Brightwav3/semantic-backlinks/issues/new).
+
 ## License
 
 MIT
