@@ -34,6 +34,11 @@ interface PluginSettings {
     enableRelatedPanel:  boolean;
     showLexicalBadge:    boolean;
     excludedFolders:     string[];
+    // Snippet preview (1.2.0) — requires sentence-level 1-bit index.
+    // Toggle enableSnippets then re-index vault; the two show* flags are live.
+    enableSnippets:         boolean;
+    showSnippetInSuggest:   boolean;
+    showSnippetInPanel:     boolean;
 }
 
 interface IndexEntry {
@@ -48,11 +53,23 @@ interface SerializedEntry {
     embeddings: string[];
 }
 
+// Sentence-level 1-bit index (stored in a separate file).
+interface SentenceEntry {
+    sentence: string;
+    bits:     Uint8Array;   // 1-bit quantized embedding, 32× smaller than Float32
+}
+
+interface SerializedSentenceEntry {
+    s: string;   // sentence text
+    b: string;   // base64-encoded Uint8Array of bits
+}
+
 interface SearchResult {
-    path:  string;
-    title: string;
-    score: number;
-    type?: string;
+    path:     string;
+    title:    string;
+    score:    number;
+    type?:    string;
+    snippet?: string;   // best-matching sentence from that note, if available
 }
 
 // ─── Defaults ─────────────────────────────────────────────────────────────────
@@ -72,6 +89,9 @@ const DEFAULT_SETTINGS: PluginSettings = {
     enableRelatedPanel:    true,
     showLexicalBadge:      true,
     excludedFolders:       [],
+    enableSnippets:        false,
+    showSnippetInSuggest:  true,
+    showSnippetInPanel:    true,
 };
 
 const VIEW_TYPE_RELATED = 'semantic-related-notes';
@@ -111,6 +131,55 @@ function decodeEmbedding(b64: string): Float32Array {
     return new Float32Array(bytes.buffer);
 }
 
+// ── 1-bit quantization ────────────────────────────────────────────────────────
+// Sign-bit quantization: store 1 if dimension > 0, else 0.
+// 32× smaller than Float32 (~128 bytes for 1024-dim). Uses Hamming similarity.
+
+function quantizeTo1Bit(floats: Float32Array): Uint8Array {
+    const bits = new Uint8Array(Math.ceil(floats.length / 8));
+    for (let i = 0; i < floats.length; i++) {
+        if (floats[i] > 0) bits[i >> 3] |= (1 << (i & 7));
+    }
+    return bits;
+}
+
+// Hamming similarity in [0, 1]: fraction of bits that agree.
+function hammingSimilarity(a: Uint8Array, b: Uint8Array): number {
+    let matches = 0;
+    for (let i = 0; i < a.length; i++) {
+        // Bits that agree = NOT XOR, masked to 8 bits.
+        let same = (~(a[i] ^ b[i])) & 0xFF;
+        // Popcount via Brian Kernighan.
+        same = same - ((same >> 1) & 0x55);
+        same = (same & 0x33) + ((same >> 2) & 0x33);
+        matches += ((same + (same >> 4)) & 0x0F);
+    }
+    return matches / (a.length * 8);
+}
+
+function encode1Bit(bits: Uint8Array): string {
+    let s = '';
+    for (let i = 0; i < bits.length; i++) s += String.fromCharCode(bits[i]);
+    return btoa(s);
+}
+
+function decode1Bit(b64: string): Uint8Array {
+    const s     = atob(b64);
+    const bytes = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i);
+    return bytes;
+}
+
+// Split note content into meaningful sentences for snippet indexing.
+function splitIntoSentences(text: string): string[] {
+    return text
+        .replace(/\n{2,}/g, ' ')        // collapse blank lines
+        .replace(/[#*`>_\[\]]/g, '')    // strip markdown syntax
+        .split(/(?<=[.!?])\s+/)
+        .map(s => s.trim())
+        .filter(s => s.length >= 30 && s.length <= 400);
+}
+
 // ─── Embed Queue ──────────────────────────────────────────────────────────────
 
 type QueueItem = { fn: () => Promise<number[]>; res: (v: number[]) => void; rej: (e: unknown) => void };
@@ -145,16 +214,18 @@ class EmbedQueue {
 // ─── Embeddings Manager ───────────────────────────────────────────────────────
 
 class EmbeddingsManager {
-    plugin:   SemanticBacklinksPlugin;
-    index:    Record<string, IndexEntry>;
-    indexing: boolean;
+    plugin:        SemanticBacklinksPlugin;
+    index:         Record<string, IndexEntry>;
+    sentenceIndex: Record<string, SentenceEntry[]>;
+    indexing:      boolean;
     private _queue: EmbedQueue;
 
     constructor(plugin: SemanticBacklinksPlugin) {
-        this.plugin   = plugin;
-        this.index    = {};
-        this.indexing = false;
-        this._queue   = new EmbedQueue(2);
+        this.plugin        = plugin;
+        this.index         = {};
+        this.sentenceIndex = {};
+        this.indexing      = false;
+        this._queue        = new EmbedQueue(2);
     }
 
     get settings(): PluginSettings { return this.plugin.settings; }
@@ -162,6 +233,10 @@ class EmbeddingsManager {
     // Embeddings live in a separate file so Remotely Save never syncs them.
     get _indexPath(): string {
         return `${this.plugin.app.vault.configDir}/plugins/semantic-backlinks/embeddings.json`;
+    }
+
+    get _sentenceIndexPath(): string {
+        return `${this.plugin.app.vault.configDir}/plugins/semantic-backlinks/embeddings-sentences.json`;
     }
 
     async load(): Promise<void> {
@@ -216,6 +291,30 @@ class EmbeddingsManager {
         }
         await this.plugin.app.vault.adapter.write(
             this._indexPath,
+            JSON.stringify(serializable)
+        );
+    }
+
+    async loadSentenceIndex(): Promise<void> {
+        try {
+            const raw    = await this.plugin.app.vault.adapter.read(this._sentenceIndexPath);
+            const parsed = JSON.parse(raw) as Record<string, SerializedSentenceEntry[]>;
+            for (const [path, entries] of Object.entries(parsed)) {
+                this.sentenceIndex[path] = entries.map(e => ({
+                    sentence: e.s,
+                    bits:     decode1Bit(e.b),
+                }));
+            }
+        } catch { /* file doesn't exist yet — ok */ }
+    }
+
+    async saveSentenceIndex(): Promise<void> {
+        const serializable: Record<string, SerializedSentenceEntry[]> = {};
+        for (const [path, entries] of Object.entries(this.sentenceIndex)) {
+            serializable[path] = entries.map(e => ({ s: e.sentence, b: encode1Bit(e.bits) }));
+        }
+        await this.plugin.app.vault.adapter.write(
+            this._sentenceIndexPath,
             JSON.stringify(serializable)
         );
     }
@@ -288,6 +387,21 @@ class EmbeddingsManager {
             const raw        = await Promise.all(chunks.map(c => this.getEmbedding(c)));
             const embeddings = raw.map(e => new Float32Array(e));
             this.index[file.path] = { mtime: file.stat.mtime, title: file.basename, embeddings };
+
+            // Sentence-level 1-bit index (only when enableSnippets is on).
+            if (this.settings.enableSnippets) {
+                const sentences = splitIntoSentences(content);
+                if (sentences.length > 0) {
+                    const sentRaw  = await Promise.all(sentences.map(s => this.getEmbedding(s)));
+                    this.sentenceIndex[file.path] = sentRaw.map((r, i) => ({
+                        sentence: sentences[i],
+                        bits:     quantizeTo1Bit(new Float32Array(r)),
+                    }));
+                } else {
+                    delete this.sentenceIndex[file.path];
+                }
+            }
+
             return true;
         } catch (e) {
             console.warn(`[semantic-backlinks] index failed: ${file.path}`, (e as Error).message);
@@ -314,8 +428,14 @@ class EmbeddingsManager {
         for (const p of Object.keys(this.index)) {
             if (!paths.has(p)) delete this.index[p];
         }
+        for (const p of Object.keys(this.sentenceIndex)) {
+            if (!paths.has(p)) delete this.sentenceIndex[p];
+        }
 
-        if (changed > 0) await this.save();
+        if (changed > 0) {
+            await this.save();
+            if (this.settings.enableSnippets) await this.saveSentenceIndex();
+        }
         this.indexing = false;
         return changed;
     }
@@ -331,10 +451,34 @@ class EmbeddingsManager {
             results.push({ path, title: entry.title, score });
         }
 
-        return results
+        const sorted = results
             .sort((a, b) => b.score - a.score)
             .slice(0, topK)
             .filter(r => r.score >= this.settings.similarityThreshold);
+
+        // Attach snippets via 1-bit Hamming (pure bit ops — negligible cost).
+        if (this.settings.enableSnippets && Object.keys(this.sentenceIndex).length > 0) {
+            const queryBits = quantizeTo1Bit(queryEmb);
+            for (const r of sorted) {
+                const s = this._findBestSentence(queryBits, r.path);
+                if (s) r.snippet = s;
+            }
+        }
+
+        return sorted;
+    }
+
+    private _findBestSentence(queryBits: Uint8Array, notePath: string): string | null {
+        const entries = this.sentenceIndex[notePath];
+        if (!entries?.length) return null;
+        let bestScore = 0;
+        let bestSentence = '';
+        for (const entry of entries) {
+            const score = hammingSimilarity(queryBits, entry.bits);
+            if (score > bestScore) { bestScore = score; bestSentence = entry.sentence; }
+        }
+        // Only return if meaningfully above chance (random = 0.5 for sign-bit quant).
+        return bestScore > 0.55 ? bestSentence : null;
     }
 
     get indexedCount(): number { return Object.keys(this.index).length; }
@@ -434,6 +578,10 @@ class RelatedNotesView extends ItemView {
                     void this.plugin.app.workspace.getLeaf(e.ctrlKey || e.metaKey).openFile(f);
             });
             info.createEl('span', { text: `${pct}%`, cls: 'semantic-score' });
+
+            if (r.snippet && this.plugin.settings.showSnippetInPanel) {
+                item.createEl('div', { text: `"${r.snippet}"`, cls: 'semantic-snippet' });
+            }
         }
     }
 
@@ -546,17 +694,23 @@ class SemanticSuggest extends EditorSuggest<SearchResult> {
 
     renderSuggestion(result: SearchResult, el: HTMLElement): void {
         el.addClass('semantic-suggest-item');
-        el.createEl('span', { text: result.title, cls: 'semantic-suggest-title' });
+
+        const row = el.createEl('div', { cls: 'semantic-suggest-row' });
+        row.createEl('span', { text: result.title, cls: 'semantic-suggest-title' });
 
         const isLexical = ['exact', 'prefix', 'contains', 'word'].includes(result.type ?? '');
         if (isLexical && this.settings.showLexicalBadge) {
-            el.createEl('span', { text: '↗', cls: 'semantic-suggest-badge lexical' });
+            row.createEl('span', { text: '↗', cls: 'semantic-suggest-badge lexical' });
         } else if (!isLexical) {
             const pct = Math.round(result.score * 100);
-            el.createEl('span', {
+            row.createEl('span', {
                 text: `~${pct}%`,
                 cls:  `semantic-suggest-score ${pct >= 60 ? 'high' : 'low'}`,
             });
+        }
+
+        if (result.snippet && this.settings.showSnippetInSuggest) {
+            el.createEl('div', { text: result.snippet, cls: 'semantic-suggest-snippet' });
         }
     }
 
@@ -728,6 +882,28 @@ class SemanticSettingsTab extends PluginSettingTab {
                 .onChange(async (v: number) => { s.relatedNotesCount = v; await save(); })
             );
 
+        // ── Snippet preview ─────────────────────────────────────────────────
+        new Setting(el).setName('Snippet preview').setHeading();
+
+        new Setting(el)
+            .setName('Enable snippet preview')
+            .setDesc('Show the best-matching sentence from each note next to the result. Uses a 1-bit sentence index (~same storage as the current note index). Requires a vault re-index after toggling.')
+            .addToggle(t => t.setValue(s.enableSnippets).onChange(async (v: boolean) => {
+                s.enableSnippets = v;
+                await save();
+                new Notice('Re-index your vault (Settings → Index → Re-index vault) for snippet changes to take effect.');
+            }));
+
+        new Setting(el)
+            .setName('Show snippet in inline suggest')
+            .setDesc('Display the matching sentence below each suggestion in the typing popup.')
+            .addToggle(t => t.setValue(s.showSnippetInSuggest).onChange(async (v: boolean) => { s.showSnippetInSuggest = v; await save(); }));
+
+        new Setting(el)
+            .setName('Show snippet in Related Notes panel')
+            .setDesc('Display the matching sentence below each note in the sidebar panel.')
+            .addToggle(t => t.setValue(s.showSnippetInPanel).onChange(async (v: boolean) => { s.showSnippetInPanel = v; await save(); }));
+
         // ── Excluded folders ────────────────────────────────────────────────
         new Setting(el).setName('Excluded folders').setHeading();
 
@@ -801,6 +977,7 @@ export default class SemanticBacklinksPlugin extends Plugin {
         this.embeddings   = new EmbeddingsManager(this);
         this.modifyTimers = new Map();
         await this.embeddings.load();
+        if (this.settings.enableSnippets) await this.embeddings.loadSentenceIndex();
 
         this.registerView(
             VIEW_TYPE_RELATED,
@@ -853,6 +1030,7 @@ export default class SemanticBacklinksPlugin extends Plugin {
                     if (this.embeddings.indexing) return;
                     await this.embeddings.indexFile(file);
                     await this.embeddings.save();
+                    if (this.settings.enableSnippets) await this.embeddings.saveSentenceIndex();
                     const active = this.app.workspace.getActiveFile();
                     if (this.relatedView && active?.path === file.path)
                         this.relatedView.forceUpdate(file);

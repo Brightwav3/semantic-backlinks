@@ -38,7 +38,10 @@ var DEFAULT_SETTINGS = {
   enableInlineSuggest: true,
   enableRelatedPanel: true,
   showLexicalBadge: true,
-  excludedFolders: []
+  excludedFolders: [],
+  enableSnippets: false,
+  showSnippetInSuggest: true,
+  showSnippetInPanel: true
 };
 var VIEW_TYPE_RELATED = "semantic-related-notes";
 function isExcluded(filePath, excludedFolders) {
@@ -71,6 +74,40 @@ function decodeEmbedding(b64) {
     bytes[i] = s.charCodeAt(i);
   return new Float32Array(bytes.buffer);
 }
+function quantizeTo1Bit(floats) {
+  const bits = new Uint8Array(Math.ceil(floats.length / 8));
+  for (let i = 0; i < floats.length; i++) {
+    if (floats[i] > 0)
+      bits[i >> 3] |= 1 << (i & 7);
+  }
+  return bits;
+}
+function hammingSimilarity(a, b) {
+  let matches = 0;
+  for (let i = 0; i < a.length; i++) {
+    let same = ~(a[i] ^ b[i]) & 255;
+    same = same - (same >> 1 & 85);
+    same = (same & 51) + (same >> 2 & 51);
+    matches += same + (same >> 4) & 15;
+  }
+  return matches / (a.length * 8);
+}
+function encode1Bit(bits) {
+  let s = "";
+  for (let i = 0; i < bits.length; i++)
+    s += String.fromCharCode(bits[i]);
+  return btoa(s);
+}
+function decode1Bit(b64) {
+  const s = atob(b64);
+  const bytes = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++)
+    bytes[i] = s.charCodeAt(i);
+  return bytes;
+}
+function splitIntoSentences(text) {
+  return text.replace(/\n{2,}/g, " ").replace(/[#*`>_\[\]]/g, "").split(/(?<=[.!?])\s+/).map((s) => s.trim()).filter((s) => s.length >= 30 && s.length <= 400);
+}
 var EmbedQueue = class {
   constructor(concurrency = 2) {
     this._concurrency = concurrency;
@@ -98,6 +135,7 @@ var EmbeddingsManager = class {
   constructor(plugin) {
     this.plugin = plugin;
     this.index = {};
+    this.sentenceIndex = {};
     this.indexing = false;
     this._queue = new EmbedQueue(2);
   }
@@ -107,6 +145,9 @@ var EmbeddingsManager = class {
   // Embeddings live in a separate file so Remotely Save never syncs them.
   get _indexPath() {
     return `${this.plugin.app.vault.configDir}/plugins/semantic-backlinks/embeddings.json`;
+  }
+  get _sentenceIndexPath() {
+    return `${this.plugin.app.vault.configDir}/plugins/semantic-backlinks/embeddings-sentences.json`;
   }
   async load() {
     var _a, _b, _c;
@@ -159,6 +200,29 @@ var EmbeddingsManager = class {
     }
     await this.plugin.app.vault.adapter.write(
       this._indexPath,
+      JSON.stringify(serializable)
+    );
+  }
+  async loadSentenceIndex() {
+    try {
+      const raw = await this.plugin.app.vault.adapter.read(this._sentenceIndexPath);
+      const parsed = JSON.parse(raw);
+      for (const [path, entries] of Object.entries(parsed)) {
+        this.sentenceIndex[path] = entries.map((e) => ({
+          sentence: e.s,
+          bits: decode1Bit(e.b)
+        }));
+      }
+    } catch (e) {
+    }
+  }
+  async saveSentenceIndex() {
+    const serializable = {};
+    for (const [path, entries] of Object.entries(this.sentenceIndex)) {
+      serializable[path] = entries.map((e) => ({ s: e.sentence, b: encode1Bit(e.bits) }));
+    }
+    await this.plugin.app.vault.adapter.write(
+      this._sentenceIndexPath,
       JSON.stringify(serializable)
     );
   }
@@ -229,6 +293,18 @@ ${content}`;
       const raw = await Promise.all(chunks.map((c) => this.getEmbedding(c)));
       const embeddings = raw.map((e) => new Float32Array(e));
       this.index[file.path] = { mtime: file.stat.mtime, title: file.basename, embeddings };
+      if (this.settings.enableSnippets) {
+        const sentences = splitIntoSentences(content);
+        if (sentences.length > 0) {
+          const sentRaw = await Promise.all(sentences.map((s) => this.getEmbedding(s)));
+          this.sentenceIndex[file.path] = sentRaw.map((r, i) => ({
+            sentence: sentences[i],
+            bits: quantizeTo1Bit(new Float32Array(r))
+          }));
+        } else {
+          delete this.sentenceIndex[file.path];
+        }
+      }
       return true;
     } catch (e) {
       console.warn(`[semantic-backlinks] index failed: ${file.path}`, e.message);
@@ -257,8 +333,15 @@ ${content}`;
       if (!paths.has(p))
         delete this.index[p];
     }
-    if (changed > 0)
+    for (const p of Object.keys(this.sentenceIndex)) {
+      if (!paths.has(p))
+        delete this.sentenceIndex[p];
+    }
+    if (changed > 0) {
       await this.save();
+      if (this.settings.enableSnippets)
+        await this.saveSentenceIndex();
+    }
     this.indexing = false;
     return changed;
   }
@@ -274,7 +357,31 @@ ${content}`;
       const score = Math.max(...entry.embeddings.map((e) => cosineSimilarity(queryEmb, e)));
       results.push({ path, title: entry.title, score });
     }
-    return results.sort((a, b) => b.score - a.score).slice(0, topK).filter((r) => r.score >= this.settings.similarityThreshold);
+    const sorted = results.sort((a, b) => b.score - a.score).slice(0, topK).filter((r) => r.score >= this.settings.similarityThreshold);
+    if (this.settings.enableSnippets && Object.keys(this.sentenceIndex).length > 0) {
+      const queryBits = quantizeTo1Bit(queryEmb);
+      for (const r of sorted) {
+        const s = this._findBestSentence(queryBits, r.path);
+        if (s)
+          r.snippet = s;
+      }
+    }
+    return sorted;
+  }
+  _findBestSentence(queryBits, notePath) {
+    const entries = this.sentenceIndex[notePath];
+    if (!(entries == null ? void 0 : entries.length))
+      return null;
+    let bestScore = 0;
+    let bestSentence = "";
+    for (const entry of entries) {
+      const score = hammingSimilarity(queryBits, entry.bits);
+      if (score > bestScore) {
+        bestScore = score;
+        bestSentence = entry.sentence;
+      }
+    }
+    return bestScore > 0.55 ? bestSentence : null;
   }
   get indexedCount() {
     return Object.keys(this.index).length;
@@ -368,6 +475,9 @@ ${content}`,
           void this.plugin.app.workspace.getLeaf(e.ctrlKey || e.metaKey).openFile(f);
       });
       info.createEl("span", { text: `${pct}%`, cls: "semantic-score" });
+      if (r.snippet && this.plugin.settings.showSnippetInPanel) {
+        item.createEl("div", { text: `"${r.snippet}"`, cls: "semantic-snippet" });
+      }
     }
   }
   forceUpdate(file) {
@@ -477,16 +587,20 @@ var SemanticSuggest = class extends import_obsidian.EditorSuggest {
   renderSuggestion(result, el) {
     var _a;
     el.addClass("semantic-suggest-item");
-    el.createEl("span", { text: result.title, cls: "semantic-suggest-title" });
+    const row = el.createEl("div", { cls: "semantic-suggest-row" });
+    row.createEl("span", { text: result.title, cls: "semantic-suggest-title" });
     const isLexical = ["exact", "prefix", "contains", "word"].includes((_a = result.type) != null ? _a : "");
     if (isLexical && this.settings.showLexicalBadge) {
-      el.createEl("span", { text: "\u2197", cls: "semantic-suggest-badge lexical" });
+      row.createEl("span", { text: "\u2197", cls: "semantic-suggest-badge lexical" });
     } else if (!isLexical) {
       const pct = Math.round(result.score * 100);
-      el.createEl("span", {
+      row.createEl("span", {
         text: `~${pct}%`,
         cls: `semantic-suggest-score ${pct >= 60 ? "high" : "low"}`
       });
+    }
+    if (result.snippet && this.settings.showSnippetInSuggest) {
+      el.createEl("div", { text: result.snippet, cls: "semantic-suggest-snippet" });
     }
   }
   selectSuggestion(result) {
@@ -598,6 +712,20 @@ var SemanticSettingsTab = class extends import_obsidian.PluginSettingTab {
         await save();
       })
     );
+    new import_obsidian.Setting(el).setName("Snippet preview").setHeading();
+    new import_obsidian.Setting(el).setName("Enable snippet preview").setDesc("Show the best-matching sentence from each note next to the result. Uses a 1-bit sentence index (~same storage as the current note index). Requires a vault re-index after toggling.").addToggle((t) => t.setValue(s.enableSnippets).onChange(async (v) => {
+      s.enableSnippets = v;
+      await save();
+      new import_obsidian.Notice("Re-index your vault (Settings \u2192 Index \u2192 Re-index vault) for snippet changes to take effect.");
+    }));
+    new import_obsidian.Setting(el).setName("Show snippet in inline suggest").setDesc("Display the matching sentence below each suggestion in the typing popup.").addToggle((t) => t.setValue(s.showSnippetInSuggest).onChange(async (v) => {
+      s.showSnippetInSuggest = v;
+      await save();
+    }));
+    new import_obsidian.Setting(el).setName("Show snippet in Related Notes panel").setDesc("Display the matching sentence below each note in the sidebar panel.").addToggle((t) => t.setValue(s.showSnippetInPanel).onChange(async (v) => {
+      s.showSnippetInPanel = v;
+      await save();
+    }));
     new import_obsidian.Setting(el).setName("Excluded folders").setHeading();
     new import_obsidian.Setting(el).setName("Excluded folders").setDesc("Comma-separated folder paths to skip during indexing and suggestions (e.g. Templates, Archive, Daily Notes).").addTextArea(
       (ta) => ta.setPlaceholder("Templates, Archive, Daily Notes").setValue(s.excludedFolders.join(", ")).onChange(async (v) => {
@@ -644,6 +772,8 @@ var SemanticBacklinksPlugin = class extends import_obsidian.Plugin {
     this.embeddings = new EmbeddingsManager(this);
     this.modifyTimers = /* @__PURE__ */ new Map();
     await this.embeddings.load();
+    if (this.settings.enableSnippets)
+      await this.embeddings.loadSentenceIndex();
     this.registerView(
       VIEW_TYPE_RELATED,
       (leaf) => new RelatedNotesView(leaf, this)
@@ -697,6 +827,8 @@ var SemanticBacklinksPlugin = class extends import_obsidian.Plugin {
             return;
           await this.embeddings.indexFile(file);
           await this.embeddings.save();
+          if (this.settings.enableSnippets)
+            await this.embeddings.saveSentenceIndex();
           const active = this.app.workspace.getActiveFile();
           if (this.relatedView && (active == null ? void 0 : active.path) === file.path)
             this.relatedView.forceUpdate(file);
