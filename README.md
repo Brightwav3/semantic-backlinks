@@ -9,7 +9,9 @@ An Obsidian plugin that suggests note links while you type — combining fast le
 - **Inline suggest popup** — appears as you type, just like Various Complements
   - Lexical matches (exact, prefix, partial, word boundary) appear instantly
   - Semantic matches from the embedding model appear below
+  - Optional **snippet preview** — see the best-matching sentence from each note directly in the popup
 - **Related Notes panel** — sidebar panel showing the most semantically similar notes to the one you have open
+  - Optional **snippet preview** — shows which sentence from each note matched your current context
 - **Fully local by default** — Ollama and LM Studio keep all embeddings on your machine
 - **OpenAI API support** — use `text-embedding-3-small` or any compatible model if you prefer cloud inference
 - **Auto-indexing** — vault is indexed on startup with live progress; notes are re-indexed automatically after you stop editing
@@ -54,16 +56,27 @@ Type any word — if a semantically or lexically related note exists, a popup ap
 
 - `↗` badge = note name match (lexical)
 - `~65%` = semantic similarity score
+- Italic sentence below the title = the best-matching sentence from that note (if snippet preview is enabled)
 
 Press `Enter` to insert `[[Note Title]]` and replace the typed word.
 
 ### Related Notes panel
 
-Click the brain icon in the ribbon or run **Show related notes panel** from the command palette.
+Click the brain icon in the ribbon or run **Show related notes panel** from the command palette. Each result optionally shows the sentence from the note that best matched your current context.
+
+### Snippet preview
+
+Enable **Snippet preview** in settings, then re-index your vault. The plugin builds a 1-bit quantized sentence index (~same storage size as the existing note index, 32× smaller than Float32) alongside the normal note-level index. Once indexed, you'll see the most relevant sentence from each result — making it immediately clear *why* a note was suggested without opening it.
+
+Snippet display can be toggled independently for the popup and the panel at any time without re-indexing.
 
 ## Storage
 
-Embeddings are stored in `.obsidian/plugins/semantic-backlinks/embeddings.json` using a compact binary (base64 Float32Array) format — roughly 7× smaller than storing raw floats as JSON text. This file is **device-local** — it is not synced by Remotely Save or similar plugins (which only sync `data.json`, `main.js`, `manifest.json`, and `styles.css` from plugin folders). Each device builds its own index independently.
+Embeddings are stored in `.obsidian/plugins/semantic-backlinks/embeddings.json` using a compact binary (base64 Float32Array) format — roughly 7× smaller than storing raw floats as JSON text.
+
+When snippet preview is enabled, a second file `embeddings-sentences.json` is created alongside it. This stores sentence-level embeddings in 1-bit quantized form (sign-bit only, Hamming similarity) — 32× smaller than Float32, making it roughly the same total size as the existing note index.
+
+Both files are **device-local** — they are not synced by Remotely Save or similar plugins. Each device builds its own index independently.
 
 Settings (including your OpenAI API key if set) are stored in `.obsidian/plugins/semantic-backlinks/data.json` and are synced normally by Obsidian Sync / Remotely Save.
 
@@ -90,6 +103,9 @@ Settings (including your OpenAI API key if set) are stored in `.obsidian/plugins
 | Max suggestions | 10 | Maximum popup items |
 | Enable Related Notes panel | on | Show sidebar panel |
 | Related notes count | 12 | Notes shown in the panel |
+| Enable snippet preview | off | Build sentence-level 1-bit index and show matching sentence per result. Requires re-index after toggling. |
+| Show snippet in inline suggest | on | Show matching sentence in the typing popup (only if snippet preview is enabled) |
+| Show snippet in Related Notes panel | on | Show matching sentence in the sidebar panel (only if snippet preview is enabled) |
 | Excluded folders | — | Comma-separated folder paths to skip (e.g. `Templates, Archive`) |
 | Auto-reindex delay | 12s | Idle time after editing before re-indexing |
 
