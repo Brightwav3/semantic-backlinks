@@ -271,6 +271,40 @@ var EmbeddingsManager = class {
   async getEmbedding(text) {
     return this._queue.run(() => this._retry(() => this._fetchEmbedding(text)));
   }
+  // Batch variant — sends all texts in a single API request (1 call per note instead of N).
+  async _fetchEmbeddingBatch(texts) {
+    const { provider, serverUrl, embeddingModel, apiKey } = this.settings;
+    if (provider === "ollama") {
+      const res = await (0, import_obsidian.requestUrl)({
+        url: `${serverUrl}/api/embed`,
+        method: "POST",
+        contentType: "application/json",
+        body: JSON.stringify({ model: embeddingModel, input: texts }),
+        throw: false
+      });
+      if (res.status !== 200)
+        throw new Error(`Ollama HTTP ${res.status}`);
+      return res.json.embeddings;
+    } else {
+      const headers = {};
+      if (apiKey)
+        headers["Authorization"] = `Bearer ${apiKey}`;
+      const res = await (0, import_obsidian.requestUrl)({
+        url: `${serverUrl}/v1/embeddings`,
+        method: "POST",
+        contentType: "application/json",
+        headers,
+        body: JSON.stringify({ model: embeddingModel, input: texts }),
+        throw: false
+      });
+      if (res.status !== 200)
+        throw new Error(`${provider === "openai" ? "OpenAI" : "LM Studio"} HTTP ${res.status}`);
+      return res.json.data.map((d) => d.embedding);
+    }
+  }
+  async getEmbeddingBatch(texts) {
+    return this._retry(() => this._fetchEmbeddingBatch(texts));
+  }
   _chunkText(title, content) {
     const CHUNK = 1500;
     const OVERLAP = 300;
@@ -295,9 +329,9 @@ ${content}`;
       const embeddings = raw.map((e) => new Float32Array(e));
       this.index[file.path] = { mtime: file.stat.mtime, title: file.basename, embeddings };
       if (this.settings.enableSnippets) {
-        const sentences = splitIntoSentences(content);
+        const sentences = splitIntoSentences(content).slice(0, 20);
         if (sentences.length > 0) {
-          const sentRaw = await Promise.all(sentences.map((s) => this.getEmbedding(s)));
+          const sentRaw = await this.getEmbeddingBatch(sentences);
           this.sentenceIndex[file.path] = sentRaw.map((r, i) => ({
             sentence: sentences[i],
             bits: quantizeTo1Bit(new Float32Array(r))

@@ -370,6 +370,40 @@ class EmbeddingsManager {
         return this._queue.run(() => this._retry(() => this._fetchEmbedding(text)));
     }
 
+    // Batch variant — sends all texts in a single API request (1 call per note instead of N).
+    private async _fetchEmbeddingBatch(texts: string[]): Promise<number[][]> {
+        const { provider, serverUrl, embeddingModel, apiKey } = this.settings;
+
+        if (provider === 'ollama') {
+            const res = await requestUrl({
+                url:         `${serverUrl}/api/embed`,
+                method:      'POST',
+                contentType: 'application/json',
+                body:        JSON.stringify({ model: embeddingModel, input: texts }),
+                throw:       false,
+            });
+            if (res.status !== 200) throw new Error(`Ollama HTTP ${res.status}`);
+            return (res.json as { embeddings: number[][] }).embeddings;
+        } else {
+            const headers: Record<string, string> = {};
+            if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+            const res = await requestUrl({
+                url:         `${serverUrl}/v1/embeddings`,
+                method:      'POST',
+                contentType: 'application/json',
+                headers,
+                body:        JSON.stringify({ model: embeddingModel, input: texts }),
+                throw:       false,
+            });
+            if (res.status !== 200) throw new Error(`${provider === 'openai' ? 'OpenAI' : 'LM Studio'} HTTP ${res.status}`);
+            return (res.json as { data: { embedding: number[] }[] }).data.map(d => d.embedding);
+        }
+    }
+
+    async getEmbeddingBatch(texts: string[]): Promise<number[][]> {
+        return this._retry(() => this._fetchEmbeddingBatch(texts));
+    }
+
     private _chunkText(title: string, content: string): string[] {
         const CHUNK   = 1500;
         const OVERLAP = 300;
@@ -393,11 +427,11 @@ class EmbeddingsManager {
             const embeddings = raw.map(e => new Float32Array(e));
             this.index[file.path] = { mtime: file.stat.mtime, title: file.basename, embeddings };
 
-            // Sentence-level 1-bit index (only when enableSnippets is on).
+            // Sentence-level 1-bit index — one batch request per note instead of N.
             if (this.settings.enableSnippets) {
-                const sentences = splitIntoSentences(content);
+                const sentences = splitIntoSentences(content).slice(0, 20); // cap at 20
                 if (sentences.length > 0) {
-                    const sentRaw  = await Promise.all(sentences.map(s => this.getEmbedding(s)));
+                    const sentRaw = await this.getEmbeddingBatch(sentences);
                     this.sentenceIndex[file.path] = sentRaw.map((r, i) => ({
                         sentence: sentences[i],
                         bits:     quantizeTo1Bit(new Float32Array(r)),
