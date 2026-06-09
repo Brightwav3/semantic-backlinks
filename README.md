@@ -1,5 +1,7 @@
 # Semantic Backlinks
 
+![Demo](assets/demo.gif)
+
 An Obsidian plugin that suggests note links while you type — combining fast lexical matching with semantic search powered by a local [Ollama](https://ollama.ai) / [LM Studio](https://lmstudio.ai) embedding model or the OpenAI API.
 
 ## Features
