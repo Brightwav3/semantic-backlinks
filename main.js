@@ -738,7 +738,7 @@ var SemanticBacklinksPlugin = class extends import_obsidian.Plugin {
       leaf = (_a = workspace.getRightLeaf(false)) != null ? _a : workspace.getLeaf(true);
       await leaf.setViewState({ type: VIEW_TYPE_RELATED, active: true });
     }
-    workspace.revealLeaf(leaf);
+    await workspace.revealLeaf(leaf);
     const active = workspace.getActiveFile();
     if (active)
       (_b = this.relatedView) == null ? void 0 : _b.forceUpdate(active);

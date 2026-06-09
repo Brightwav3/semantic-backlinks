@@ -891,7 +891,7 @@ export default class SemanticBacklinksPlugin extends Plugin {
             leaf = workspace.getRightLeaf(false) ?? workspace.getLeaf(true);
             await leaf.setViewState({ type: VIEW_TYPE_RELATED, active: true });
         }
-        workspace.revealLeaf(leaf);
+        await workspace.revealLeaf(leaf);
         const active = workspace.getActiveFile();
         if (active) this.relatedView?.forceUpdate(active);
     }

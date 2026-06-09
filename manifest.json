@@ -2,7 +2,7 @@
   "id": "semantic-backlinks",
   "name": "Semantic Backlinks",
   "version": "1.0.0",
-  "minAppVersion": "1.4.0",
+  "minAppVersion": "1.7.0",
   "description": "Semantic note suggestions and related notes panel powered by local Ollama embeddings (bge-m3).",
   "author": "Brightwav3",
   "authorUrl": "https://github.com/Brightwav3",
