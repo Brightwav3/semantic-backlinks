@@ -173,9 +173,10 @@ function decode1Bit(b64: string): Uint8Array {
 // Split note content into meaningful sentences for snippet indexing.
 function splitIntoSentences(text: string): string[] {
     return text
-        .replace(/\n{2,}/g, ' ')        // collapse blank lines
-        .replace(/[#*`>_\[\]]/g, '')    // strip markdown syntax
-        .split(/(?<=[.!?])\s+/)
+        .replace(/\n{2,}/g, ' ')           // collapse blank lines
+        .replace(/[#*`>_[\]]/g, '')        // strip markdown syntax
+        .replace(/([.!?])\s+/g, '$1\n')   // mark sentence boundaries (no lookbehind — iOS compat)
+        .split('\n')
         .map(s => s.trim())
         .filter(s => s.length >= 30 && s.length <= 400);
 }

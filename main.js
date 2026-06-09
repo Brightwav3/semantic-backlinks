@@ -106,7 +106,7 @@ function decode1Bit(b64) {
   return bytes;
 }
 function splitIntoSentences(text) {
-  return text.replace(/\n{2,}/g, " ").replace(/[#*`>_\[\]]/g, "").split(/(?<=[.!?])\s+/).map((s) => s.trim()).filter((s) => s.length >= 30 && s.length <= 400);
+  return text.replace(/\n{2,}/g, " ").replace(/[#*`>_[\]]/g, "").replace(/([.!?])\s+/g, "$1\n").split("\n").map((s) => s.trim()).filter((s) => s.length >= 30 && s.length <= 400);
 }
 var EmbedQueue = class {
   constructor(concurrency = 2) {
